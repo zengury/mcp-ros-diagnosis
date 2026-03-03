@@ -85,15 +85,6 @@ manastone-diagnostic/
 - [x] MCP Server 基础
 - [x] Gradio Web UI 基础
 
-## 开发计划
-
-| 周次 | 目标 | 关键交付 |
-|------|------|----------|
-| Week 1 | 骨架搭通 | ✅ 项目框架 + DDS Bridge + 模拟数据 |
-| Week 2 | 语义化 + Skill | 8 条故障 Skill + 语义化引擎 |
-| Week 3 | Agent 编排 + LLM | Qwen2.5-7B 部署 + 编排引擎 |
-| Week 4 | UI + 联调 | 完整端到端 + README |
-
 ## 核心设计原则
 
 1. **只读诊断** - 不暴露任何控制类 Tool
