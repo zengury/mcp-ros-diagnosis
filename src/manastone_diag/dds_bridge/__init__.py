@@ -252,7 +252,8 @@ class DDSSubscriber:
             qos = QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
                 depth=10,
-                reliability=ReliabilityPolicy.RELIABLE,
+                # X2 topics are published with BEST_EFFORT (rosbag metadata reliability=2)
+                reliability=ReliabilityPolicy.BEST_EFFORT,
                 durability=DurabilityPolicy.VOLATILE,
             )
 
@@ -399,19 +400,37 @@ class DDSBridge:
         """启动 DDS Bridge"""
         if self.config.mock_mode:
             self._subscriber = MockDDSSubscriber()
-        else:
+            await self._subscriber.start()
+            return
+
+        try:
             self._subscriber = DDSSubscriber(
                 domain_id=self.config.dds.domain_id,
                 topics=self.config.dds.topics,
             )
-        
-        # 注册缓存回调
-        self._subscriber.register_callback(
-            "rt/lf/lowstate", 
-            self._on_lowstate
-        )
-        
-        await self._subscriber.start()
+
+            # 注册缓存回调
+            self._subscriber.register_callback(
+                "rt/lf/lowstate",
+                self._on_lowstate
+            )
+            await self._subscriber.start()
+        except ModuleNotFoundError as e:
+            # UI / 开发机上缺少 ROS2 运行时时，自动降级为模拟模式，避免服务启动失败
+            if e.name in {"rclpy", "aimdk_msgs"}:
+                logger.warning(
+                    "缺少 ROS2 依赖 (%s)，自动切换到 mock 模式。"
+                    "如需连接真机，请先 source ROS2 环境并安装对应消息包。",
+                    e.name,
+                )
+                self._subscriber = MockDDSSubscriber()
+                self._subscriber.register_callback(
+                    "rt/lf/lowstate",
+                    self._on_lowstate
+                )
+                await self._subscriber.start()
+                return
+            raise
     
     def set_scenario(self, scenario_name: str) -> bool:
         """切换 mock 场景（仅 mock 模式有效）"""

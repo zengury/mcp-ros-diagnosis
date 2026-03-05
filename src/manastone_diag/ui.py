@@ -3,8 +3,43 @@ Manastone Diagnostic Web UI - Gradio 界面
 """
 
 import asyncio
+import importlib.util
 import logging
+import os
 import threading
+
+
+def _normalize_proxy_env() -> None:
+    """兼容部分环境里的 socks:// 代理写法（httpx 需要 socks5://）。"""
+    proxy_vars = (
+        "ALL_PROXY", "all_proxy",
+        "HTTP_PROXY", "http_proxy",
+        "HTTPS_PROXY", "https_proxy",
+    )
+    for key in proxy_vars:
+        value = os.getenv(key)
+        if value and value.startswith("socks://"):
+            fixed = "socks5://" + value[len("socks://"):]
+            os.environ[key] = fixed
+            logging.getLogger(__name__).warning(
+                "环境变量 %s 使用了 socks://，已自动改为 %s", key, fixed
+            )
+
+    # 如果仍使用 SOCKS 代理但环境未安装 socksio，则禁用代理避免 Gradio/httpx 启动失败
+    has_socks_proxy = any(
+        (os.getenv(k) or "").startswith("socks5://")
+        for k in proxy_vars
+    )
+    if has_socks_proxy and importlib.util.find_spec("socksio") is None:
+        for key in proxy_vars:
+            if os.getenv(key):
+                os.environ.pop(key, None)
+        logging.getLogger(__name__).warning(
+            "检测到 SOCKS 代理但缺少 socksio，已为当前 manastone-ui 进程禁用代理环境变量。"
+        )
+
+
+_normalize_proxy_env()
 
 import gradio as gr
 
@@ -124,6 +159,7 @@ def compare_symmetric() -> str:
 
 def chat_response(message: str, history: list) -> tuple[str, list]:
     """通过 LLM + 知识库回答问题"""
+    history = history or []
     if not message.strip():
         return "", history
 
@@ -138,7 +174,10 @@ def chat_response(message: str, history: list) -> tuple[str, list]:
     except Exception as e:
         reply = f"处理失败: {e}"
 
-    history = history + [(message, reply)]
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": reply},
+    ]
     return "", history
 
 

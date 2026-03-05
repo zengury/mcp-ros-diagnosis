@@ -2,6 +2,7 @@
 MCP Server 主入口
 """
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -272,7 +273,10 @@ def main():
     # host/port 在 FastMCP 构造时设置；运行时只传 transport
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
-    mcp.run(transport=config.server.transport)
+    try:
+        mcp.run(transport=config.server.transport)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Server stopped by user.")
 
 
 if __name__ == "__main__":

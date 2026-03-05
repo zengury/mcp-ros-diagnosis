@@ -15,7 +15,11 @@
 ### 1. 安装
 
 ```bash
-# 在 G1 Orin NX 上执行
+# 推荐：先使用独立 conda 环境（更安全）
+conda create -n mcp-ros-diagnosis python=3.10 -y
+conda activate mcp-ros-diagnosis
+
+# 在机器人 Orin / 开发机上执行
 git clone <repo-url>
 cd manastone-diagnostic
 
@@ -40,6 +44,13 @@ manastone-ui    # 启动 Web UI
 #### 模式 B：连接 X2 真机（ROS2）
 
 ```bash
+# 先加载 ROS2 环境（确保 rclpy 和 aimdk_msgs 可用）
+source /opt/ros/<distro>/setup.bash
+source <your_ros2_ws>/install/setup.bash
+
+# 再激活项目 conda 环境
+conda activate mcp-ros-diagnosis
+
 # 启动服务
 manastone-diag
 ```
