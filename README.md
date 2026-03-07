@@ -93,6 +93,44 @@ my_pi_ext = "my_pi_ext.plugin:register"
 
 加载成功后会新增对应 MCP tools/resources，并在 `g1://system/health` 的 `extensions` 字段中显示已启用扩展。
 
+### 与上次 PR 冲突时的处理流程
+
+如果你在本分支继续开发 extension，遇到和上次 PR 的冲突，可按下面步骤处理：
+
+```bash
+# 1) 确保本地分支最新
+git fetch origin
+
+# 2) 切到你的开发分支
+git checkout <your-branch>
+
+# 3) 先看冲突来源（推荐 rebase 到主分支最新）
+git rebase origin/main
+
+# 4) 解决冲突文件后标记已解决
+git add <resolved-files>
+
+# 5) 继续 rebase
+git rebase --continue
+
+# 若想放弃本次 rebase
+# git rebase --abort
+```
+
+冲突文件可优先检查这几个 extension 相关位置：
+- `src/manastone_diag/extensions/registry.py`（加载策略是否一致）
+- `src/manastone_diag/server.py`（启动阶段是否重复注册）
+- `README.md`（文档说明是否重复/冲突）
+
+如果你使用 merge 工作流，也可以改用：
+
+```bash
+git merge origin/main
+# 解决冲突后
+git add <resolved-files>
+git commit
+```
+
 ### 3. 访问
 
 - **Web UI**: http://192.168.123.164:7860
