@@ -84,6 +84,7 @@ class Config:
     models_dir: str = field(default_factory=lambda: os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models"
     ))
+    extension_modules: list[str] = field(default_factory=list)
 
 
 # 全局配置实例
@@ -116,6 +117,9 @@ def get_config() -> Config:
             val = os.getenv(env_name)
             if val:
                 _config.dds.topics[topic_key] = val
+        extension_env = os.getenv("MANASTONE_EXTENSIONS", "")
+        if extension_env.strip():
+            _config.extension_modules = [m.strip() for m in extension_env.split(",") if m.strip()]
     return _config
 
 

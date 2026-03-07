@@ -71,6 +71,17 @@ manastone-diag
 - `MANASTONE_TOPIC_JOINT_HEAD_STATE`
 - `MANASTONE_TOPIC_PMU_STATE`
 
+### Extension 扩展机制
+
+可通过环境变量动态加载 extension（模块内需提供 `register(server)` 函数）：
+
+```bash
+export MANASTONE_EXTENSIONS="manastone_diag.extensions.demo_extension"
+manastone-diag
+```
+
+加载后会新增对应 MCP tools/resources，并在 `g1://system/health` 的 `extensions` 字段中显示已启用扩展。
+
 ### 3. 访问
 
 - **Web UI**: http://192.168.123.164:7860
