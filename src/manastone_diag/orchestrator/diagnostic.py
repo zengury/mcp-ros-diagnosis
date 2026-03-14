@@ -1,6 +1,16 @@
 """
-诊断编排器 - 结合机器人状态 + 知识库 Skill + LLM，回答用户问题
+诊断编排器 v0.4
+基于新的 EventLog + SchemaLoader 架构重写。
+
+职责：
+  - 接收用户自然语言查询
+  - 从 EventLog 取活跃告警 + 最近事件作为上下文
+  - 检索 Skill 知识库（YAML + SKILL.md）
+  - 调用 LLM 生成诊断回复
+  - LLM 不可用时降级为基于规则的回复
 """
+
+from __future__ import annotations
 
 import logging
 import os
@@ -11,301 +21,224 @@ from typing import Any
 import yaml
 
 from ..llm import LLMClient
-from ..semantic import describe_robot_state
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """你是 Manastone Diagnostic，Unitree G1 人形机器人的专属运维诊断助手。
 
 你的工作方式：
-1. 结合用户描述 + 当前机器人传感器状态，判断可能的故障
-2. 从知识库中找到最相关的故障条目，给出有依据的诊断
-3. 提供分步骤的处理建议（立即处理 / 短期 / 长期）
+1. 优先参考【活跃告警】中已检测到的异常，这是基于传感器实时数据的客观事实
+2. 结合用户描述，从【故障知识库】中找到最相关的故障条目
+3. 给出有依据的诊断和分步骤的处理建议
 
-回答要求：
+回答格式：
 - 用中文回答，简洁直接
-- 先给出判断（1-2句），再给操作建议
-- 如果状态数据与用户描述一致，主动指出
-- 不要编造数据，不确定时说明
+- 先说判断（1-2句），再说操作建议
+- 如果活跃告警与用户描述吻合，主动指出
+- 不确定时说明，不编造数据
+
+可用工具提示：
+- 工程师可以用 joint_history(关节名) 查看某关节的完整事件历史
+- 工程师可以用 component_status() 查看当前所有关节实时数据
 """
 
-# 关键词 → skill文件ID 映射
+# 关键词 → Skill 文件 ID 映射
 _SKILL_KEYWORDS: dict[str, list[str]] = {
     "joint-overheat":      ["热", "温", "烫", "过热", "temperature", "散热", "发烫"],
     "gait-instability":    ["走", "步态", "偏", "不稳", "倒", "gait", "walk", "摔", "平衡"],
-    "communication-fault": ["通信", "连接", "dds", "话题", "延迟", "心跳", "掉线", "断开"],
-    "power-system":        ["电", "电池", "充电", "power", "电压", "断电", "欠压", "过压"],
-    "sensor-calibration":  ["传感器", "imu", "摄像头", "相机", "激光", "标定", "漂移", "陀螺", "realsense"],
+    "communication-fault": ["通信", "连接", "dds", "话题", "延迟", "心跳", "掉线", "断开", "lost"],
+    "power-system":        ["电", "电池", "充电", "power", "电压", "断电", "欠压", "过压", "soc"],
+    "sensor-calibration":  ["传感器", "imu", "摄像头", "相机", "激光", "标定", "漂移", "陀螺"],
 }
 
 
 class DiagnosticOrchestrator:
-    def __init__(self, llm: LLMClient, knowledge_dir: str,
-                 skills_dir: str | None = None):
+    def __init__(self, llm: LLMClient, knowledge_dir: str, skills_dir: str | None = None):
         self.llm = llm
-        # 默认 skills 目录在 knowledge/skills/（包内）
         if skills_dir is None:
             skills_dir = os.path.join(knowledge_dir, "skills")
         self.yaml_skills = self._load_yaml_skills(knowledge_dir)
         self.skill_files = self._load_skill_files(skills_dir)
-        logger.info(
-            f"已加载 {len(self.yaml_skills)} 条 YAML 故障知识, "
-            f"{len(self.skill_files)} 份运维手册"
-        )
+        logger.info("Orchestrator ready: %d YAML faults, %d skill docs",
+                    len(self.yaml_skills), len(self.skill_files))
 
-    # ------------------------------------------------------------------
-    # 数据加载
-    # ------------------------------------------------------------------
+    # ── 知识库加载 ────────────────────────────────────────────
 
     def _load_yaml_skills(self, knowledge_dir: str) -> list[dict]:
         path = Path(knowledge_dir) / "fault_library.yaml"
         if not path.exists():
-            logger.warning(f"知识库文件不存在: {path}")
+            logger.warning("fault_library.yaml not found: %s", path)
             return []
         with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        return data.get("faults", [])
+            return yaml.safe_load(f).get("faults", [])
 
     def _load_skill_files(self, skills_dir: str) -> list[dict]:
-        """加载 knowledge/skills/ 下的 SKILL.md 文件"""
-        skills_path = Path(skills_dir)
-        if not skills_path.exists():
-            logger.warning(f"Skill 文档目录不存在: {skills_path}")
-            return []
-
         result = []
-        for skill_dir in sorted(skills_path.iterdir()):
-            skill_file = skill_dir / "SKILL.md"
-            if not skill_file.exists():
+        p = Path(skills_dir)
+        if not p.exists():
+            return result
+        for skill_dir in sorted(p.iterdir()):
+            sf = skill_dir / "SKILL.md"
+            if not sf.exists():
                 continue
-
-            content = skill_file.read_text(encoding="utf-8")
-
-            # 解析元信息（前 25 行）
-            meta = {"id": skill_dir.name, "name": skill_dir.name,
-                    "category": "", "related_components": []}
+            content = sf.read_text(encoding="utf-8")
+            meta = {"id": skill_dir.name, "name": skill_dir.name, "category": ""}
             for line in content.splitlines()[:25]:
-                if "**id**:" in line:
-                    meta["id"] = line.split(":", 1)[1].strip()
-                elif "**name**:" in line:
-                    meta["name"] = line.split(":", 1)[1].strip()
-                elif "**category**:" in line:
-                    meta["category"] = line.split(":", 1)[1].strip()
-                elif "**related_components**:" in line:
-                    raw = line.split(":", 1)[1].strip()
-                    try:
-                        import json
-                        meta["related_components"] = json.loads(raw)
-                    except Exception:
-                        pass
-
-            # 生成摘要：去除 ASCII 框线图、代码块，保留文字段落
-            excerpt = self._extract_text_excerpt(content, max_chars=2500)
-
-            result.append({
-                "id": meta["id"],
-                "name": meta["name"],
-                "category": meta["category"],
-                "related_components": meta["related_components"],
-                "content": content,    # 用于关键词匹配
-                "excerpt": excerpt,    # 发给 LLM 的摘要
-            })
-            logger.info(f"已加载 Skill 文档: {meta['name']} ({skill_dir.name})")
-
+                if "**id**:" in line:     meta["id"]       = line.split(":", 1)[1].strip()
+                elif "**name**:" in line:  meta["name"]     = line.split(":", 1)[1].strip()
+                elif "**category**:" in line: meta["category"] = line.split(":", 1)[1].strip()
+            result.append({**meta, "content": content,
+                           "excerpt": self._extract_excerpt(content, 2000)})
         return result
 
     @staticmethod
-    def _extract_text_excerpt(content: str, max_chars: int) -> str:
-        """从 Markdown 中提取纯文字段落，去除 ASCII 框线和代码块"""
-        lines = []
-        in_code_block = False
+    def _extract_excerpt(content: str, max_chars: int) -> str:
+        lines, in_code = [], False
         for line in content.splitlines():
             if line.startswith("```"):
-                in_code_block = not in_code_block
-                continue
-            if in_code_block:
-                continue
-            # 去除 ASCII 框线字符
-            if re.match(r'^[│┌└╔╗╚╝═─┬┴├┤┼╠╣╦╩╪╬▲▼\s]+$', line):
-                continue
+                in_code = not in_code; continue
+            if in_code: continue
+            if re.match(r'^[│┌└╔╗╚╝═─┬┴├┤┼╠╣╦╩╪╬▲▼\s]+$', line): continue
             lines.append(line)
-        text = "\n".join(lines)
-        # 折叠连续空行
-        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', "\n".join(lines))
         return text[:max_chars]
 
-    # ------------------------------------------------------------------
-    # 检索
-    # ------------------------------------------------------------------
+    # ── 检索 ──────────────────────────────────────────────────
 
-    def _find_relevant_yaml_skills(self, query: str, state_text: str) -> list[dict]:
-        """基于关键词匹配找到最相关的 YAML 故障条目（最多 3 条）"""
-        combined = (query + " " + state_text).lower()
-
+    def _find_yaml_skills(self, query: str, context_text: str) -> list[dict]:
+        combined = (query + " " + context_text).lower()
         scored = []
         for skill in self.yaml_skills:
             score = 0
-            for word in skill.get("name", "").split():
-                if word in combined:
-                    score += 3
-            for symptom in skill.get("symptoms", []):
-                for word in symptom.split():
-                    if len(word) >= 2 and word in combined:
-                        score += 2
-            if skill.get("category", "") in combined:
-                score += 2
-            # 特定触发词
-            if any(kw in combined for kw in ["温", "热", "烫", "temperature"]):
-                if skill.get("id") in ("FK-003", "FK-002"):
-                    score += 4
-            if any(kw in combined for kw in ["编码", "通信", "encoder"]):
-                if skill.get("id") == "FK-001":
-                    score += 4
-            if any(kw in combined for kw in ["位置", "跟踪", "偏", "漂"]):
-                if skill.get("id") == "FK-007":
-                    score += 4
-            if any(kw in combined for kw in ["摄像", "相机", "深度", "realsense"]):
-                if skill.get("id") == "FK-005":
-                    score += 4
-            if any(kw in combined for kw in ["激光", "点云", "lidar", "雷达"]):
-                if skill.get("id") == "FK-004":
-                    score += 4
-            if any(kw in combined for kw in ["手", "灵巧", "手指"]):
-                if skill.get("id") == "FK-008":
-                    score += 4
-            if any(kw in combined for kw in ["imu", "姿态", "漂移", "陀螺"]):
-                if skill.get("id") == "FK-006":
-                    score += 4
+            for w in skill.get("name", "").split():
+                if w in combined: score += 3
+            for sym in skill.get("symptoms", []):
+                for w in sym.split():
+                    if len(w) >= 2 and w in combined: score += 2
+            # 硬触发词
+            kw_map = {
+                "FK-001": ["编码", "通信", "encoder", "lost"],
+                "FK-002": ["过流", "overcurrent", "堵转"],
+                "FK-003": ["热", "温", "烫", "temperature"],
+                "FK-004": ["lidar", "点云", "激光"],
+                "FK-005": ["realsense", "相机", "深度"],
+                "FK-006": ["imu", "漂移", "陀螺"],
+                "FK-007": ["跟踪", "位置误差", "抖动"],
+                "FK-008": ["灵巧手", "hand", "手指"],
+            }
+            for fid, kws in kw_map.items():
+                if skill.get("id") == fid and any(k in combined for k in kws):
+                    score += 5
             if score > 0:
                 scored.append((score, skill))
-
         scored.sort(key=lambda x: -x[0])
         return [s for _, s in scored[:3]]
 
-    def _find_relevant_skill_files(self, query: str, state_text: str) -> list[dict]:
-        """基于关键词匹配找到最相关的 SKILL.md 文档（最多 2 份）"""
-        combined = (query + " " + state_text).lower()
-
+    def _find_skill_files(self, query: str, context_text: str) -> list[dict]:
+        combined = (query + " " + context_text).lower()
         scored = []
         for skill in self.skill_files:
-            score = 0
-            skill_id = skill["id"]
-
-            # 关键词映射
-            for kw in _SKILL_KEYWORDS.get(skill_id, []):
-                if kw in combined:
-                    score += 3
-
-            # 分类匹配
-            if skill.get("category", "") in combined:
-                score += 2
-
-            # 名称匹配
-            for word in skill.get("name", "").split():
-                if len(word) >= 2 and word in combined:
-                    score += 2
-
-            # 相关组件匹配
-            for comp in skill.get("related_components", []):
-                if comp.lower() in combined:
-                    score += 1
-
-            # 全文关键词（低分值，避免噪音）
-            for kw in _SKILL_KEYWORDS.get(skill_id, []):
-                if kw in skill["content"].lower() and kw in combined:
-                    score += 1
-
+            score = sum(3 for kw in _SKILL_KEYWORDS.get(skill["id"], []) if kw in combined)
+            score += sum(2 for w in skill.get("name","").split() if len(w) >= 2 and w in combined)
             if score > 0:
                 scored.append((score, skill))
-
         scored.sort(key=lambda x: -x[0])
         return [s for _, s in scored[:2]]
 
-    # ------------------------------------------------------------------
-    # 格式化
-    # ------------------------------------------------------------------
+    # ── 格式化 ────────────────────────────────────────────────
 
-    def _format_yaml_skills(self, skills: list[dict]) -> str:
-        if not skills:
-            return "（未找到直接相关的故障知识条目）"
-
+    def _fmt_active_warnings(self, warnings: list[dict]) -> str:
+        if not warnings:
+            return "（当前无活跃告警）"
         lines = []
-        for sk in skills:
-            lines.append(f"## [{sk['id']}] {sk['name']} (严重度: {sk['severity']})")
-            lines.append(f"根因说明: {sk.get('root_cause_explanation', '').strip()}")
-            causes = sk.get("possible_causes", [])
-            if causes:
-                lines.append("可能原因: " + "；".join(causes))
-            guide = sk.get("repair_guide", {})
-            immediate = guide.get("immediate", [])
-            if immediate:
-                lines.append("立即处理: " + "；".join(immediate))
-            short_term = guide.get("short_term", [])
-            if short_term:
-                lines.append("短期处理: " + "；".join(short_term))
-            lines.append("")
+        for w in warnings[:10]:
+            lines.append(
+                f"  [{w.get('severity','?')}] {w.get('event_type','')} | "
+                f"{w.get('component_name', w.get('component_id','?'))} | "
+                f"值={w.get('value','?')}{w.get('unit','')}"
+            )
         return "\n".join(lines)
 
-    def _format_skill_files(self, skills: list[dict]) -> str:
+    def _fmt_yaml_skills(self, skills: list[dict]) -> str:
         if not skills:
-            return ""
+            return "（未找到相关故障知识）"
         lines = []
         for sk in skills:
-            lines.append(f"### 运维手册：{sk['name']}")
-            lines.append(sk["excerpt"])
-            lines.append("")
+            lines += [
+                f"## [{sk['id']}] {sk['name']} (严重度: {sk['severity']})",
+                f"根因: {sk.get('root_cause_explanation','').strip()[:200]}",
+                "可能原因: " + "；".join(sk.get("possible_causes", [])[:3]),
+                "立即处理: " + "；".join((sk.get("repair_guide",{}).get("immediate",[]))[:2]),
+                "",
+            ]
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # 主入口
-    # ------------------------------------------------------------------
+    # ── 主入口 ────────────────────────────────────────────────
 
     async def handle_query(
-        self, user_message: str, joints_status: dict[str, Any]
+        self,
+        user_message: str,
+        context: dict[str, Any],
     ) -> str:
-        """编排完整诊断流程：状态 → 语义化 → 检索知识 → LLM → 回复"""
+        """
+        诊断主流程。
 
-        # 1. 语义化机器人状态
-        state_text = describe_robot_state(joints_status)
+        context 期望包含：
+          active_warnings: list[dict]  — 来自 EventLog.get_active_warnings()
+          joint_snapshot:  dict | None — 来自 DDSBridge.get_topic_data()
+          event_stats:     dict        — 来自 EventLog.stats()
+        """
+        active_warnings = context.get("active_warnings", [])
+        event_stats     = context.get("event_stats", {})
 
-        # 2. 检索相关 YAML 故障条目
-        relevant_yaml = self._find_relevant_yaml_skills(user_message, state_text)
-        yaml_text = self._format_yaml_skills(relevant_yaml)
+        # 构建上下文文本供知识检索
+        context_text = " ".join(
+            f"{w.get('event_type','')} {w.get('component_name','')}"
+            for w in active_warnings
+        )
 
-        # 3. 检索相关运维手册
-        relevant_files = self._find_relevant_skill_files(user_message, state_text)
-        files_text = self._format_skill_files(relevant_files)
+        # 检索知识库
+        yaml_skills = self._find_yaml_skills(user_message, context_text)
+        skill_files = self._find_skill_files(user_message, context_text)
 
-        # 4. 构建完整 prompt
-        full_message = f"""用户问题：{user_message}
+        # 构建 prompt
+        prompt = f"""用户问题：{user_message}
 
-【当前机器人状态】
-{state_text}
+【活跃告警（基于实时传感器，客观事实）】
+{self._fmt_active_warnings(active_warnings)}
 
-【结构化故障知识库】
-{yaml_text}"""
+事件统计：总计 {event_stats.get('total_events',0)} 条事件，
+当前活跃告警 {event_stats.get('active_warnings',0)} 个
 
-        if files_text:
-            full_message += f"\n\n【运维手册参考】\n{files_text}"
+【故障知识库】
+{self._fmt_yaml_skills(yaml_skills)}"""
 
-        # 5. 调用 LLM
+        if skill_files:
+            excerpts = "\n\n".join(
+                f"### {sf['name']}\n{sf['excerpt']}" for sf in skill_files
+            )
+            prompt += f"\n\n【运维手册参考】\n{excerpts}"
+
+        # 调用 LLM
         try:
-            response = await self.llm.chat(full_message, system_prompt=SYSTEM_PROMPT)
-            return response
+            return await self.llm.chat(prompt, system_prompt=SYSTEM_PROMPT)
         except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
-            return self._fallback_response(user_message, state_text, relevant_yaml)
+            logger.error("LLM call failed: %s", e)
+            return self._fallback(active_warnings, yaml_skills)
 
-    def _fallback_response(
-        self, query: str, state_text: str, skills: list[dict]
-    ) -> str:
-        """LLM 不可用时的降级响应"""
-        lines = ["**（LLM 不可用，基于规则响应）**", "", "**机器人当前状态：**", state_text]
+    def _fallback(self, warnings: list[dict], skills: list[dict]) -> str:
+        lines = ["**（LLM 不可用，基于规则响应）**", ""]
+        if warnings:
+            lines.append("**当前活跃告警：**")
+            for w in warnings:
+                lines.append(f"- [{w.get('severity')}] {w.get('component_name','?')}: "
+                             f"{w.get('event_type','')} 值={w.get('value','?')}{w.get('unit','')}")
+        else:
+            lines.append("当前无活跃告警。")
         if skills:
             lines += ["", "**相关故障知识：**"]
             for sk in skills:
-                lines.append(f"- [{sk['id']}] {sk['name']}: {', '.join(sk.get('possible_causes', []))}")
-                guide = sk.get("repair_guide", {})
-                for step in guide.get("immediate", []):
+                lines.append(f"- [{sk['id']}] {sk['name']}")
+                for step in sk.get("repair_guide", {}).get("immediate", [])[:2]:
                     lines.append(f"  → {step}")
         return "\n".join(lines)
