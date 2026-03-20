@@ -456,46 +456,50 @@ def create_server(**init_kwargs) -> FastMCP:
         }, ensure_ascii=False, indent=2)
 
     # ════════════════════════════════════════════════════════════
-    # Tool 5: AutoResearch Agent 循环（真正的 LLM 驱动迭代）
+    # Tool 5: autoresearch 风格 Agent 循环（忠实复现 Karpathy 架构）
     # ════════════════════════════════════════════════════════════
     @mcp.tool()
     async def pid_run_research_loop(
         joint_name: str,
         target_score: float = 85.0,
         max_experiments: int = 50,
+        initial_kp: float = 10.0,
+        initial_ki: float = 0.1,
+        initial_kd: float = 2.0,
         setpoint_rad: float = 0.5,
         experiment_duration_s: float = 2.0,
         ctx: Context = None,
     ) -> str:
         """
-        "不达目标不罢休"的 PID 调参 Agent 循环（AutoResearch 风格）。
+        Karpathy autoresearch 风格的 PID 调参循环。
 
-        ┌ 与 pid_run_auto_tuning 的本质区别 ─────────────────────┐
+        ┌ 架构对比（与 pid_run_auto_tuning）────────────────────┐
         │                                                        │
         │  pid_run_auto_tuning：                                 │
-        │    Python for-loop 控制迭代                            │
-        │    LLM 是被调用的子函数                                  │
-        │    Python 检查 score >= target 来决定停止               │
+        │    LLM.chat(history) → 返回 kp/ki/kd 数字             │
+        │    Python 用数字跑实验                                  │
+        │    LLM 推理过程隐藏在内部                               │
         │                                                        │
-        │  pid_run_research_loop：                               │
-        │    messages = [task]                                   │
-        │    while experiments < max_experiments:  ← 安全网      │
-        │        msg = llm(messages, tools)  ← LLM 是主体       │
-        │        execute(msg.tool_calls)     ← Python 执行      │
-        │        if finish 且分数达标: break                     │
-        │        if finish 但未达标: 拒绝 → 注入"继续"消息       │
-        │        if 刚跑了实验 且未达标: 自动注入"继续"消息       │
+        │  pid_run_research_loop（autoresearch 风格）：           │
+        │    LLM 读取 params.yaml 文件（含假设注释）              │
+        │    LLM 输出：修改后的 params.yaml 全文                  │
+        │    Python 写文件 → git commit → 跑实验 → 评分          │
+        │    改善 → git keep，未改善 → git revert params.yaml    │
+        │    结果追加到 results.tsv（commit_hash, score, status） │
+        │    直到达标或 max_experiments 安全网触发                 │
         └────────────────────────────────────────────────────────┘
 
-        停止条件（按优先级）：
-          1. LLM 调用 finish 且 best_score >= target_score → 成功退出
-          2. max_experiments 达到上限 → 安全网强制退出（人为设定的兜底）
-          3. LLM 提前调用 finish → 被拒绝，系统自动推它继续
+        文件结构（storage/pid_workspace/{joint_name}/）：
+          params.yaml     ← LLM 每轮修改（等价于 autoresearch/train.py）
+          program.md      ← 人写的研究方向（等价于 autoresearch/program.md）
+          results.tsv     ← 实验日志，git 历史就是研究日志
+          best_params.yaml ← 历史最优快照
 
         Args:
             joint_name:            目标关节名
-            target_score:          目标分数（LLM 不达到此分数不允许停止）
-            max_experiments:       最大实验次数安全上限（默认 50）
+            target_score:          目标分数，达到后停止（默认 85）
+            max_experiments:       安全网上限（默认 50，相当于"人中断"的替代）
+            initial_kp/ki/kd:      起始参数
             setpoint_rad:          阶跃目标位置
             experiment_duration_s: 每次实验时长
         """
@@ -504,9 +508,9 @@ def create_server(**init_kwargs) -> FastMCP:
         if not (getattr(s, "llm_client", None) and s.llm_client.is_available()):
             return json.dumps({
                 "error": (
-                    "pid_run_research_loop 需要 LLM 支持（chat_with_tools）。"
+                    "pid_run_research_loop 需要 LLM（chat 接口）。"
                     "请配置 OPENAI_API_KEY 或本地 Qwen 端点，"
-                    "或改用 pid_run_auto_tuning（规则兜底模式）。"
+                    "或改用 pid_run_auto_tuning（规则兜底）。"
                 )
             }, ensure_ascii=False, indent=2)
 
@@ -531,12 +535,12 @@ def create_server(**init_kwargs) -> FastMCP:
                 "violations": pre_check.violations,
             }, ensure_ascii=False, indent=2)
 
-        # 启动 Agent 循环（控制权交给 LLM）
+        storage_dir = Path(init_kwargs.get("storage_dir", "storage"))
         agent = PIDAgentLoop(
             llm_client=s.llm_client,
             runner=runner,
-            history=history,
             safety=safety,
+            storage_dir=storage_dir,
         )
         result = await agent.run(
             joint_name=joint_name,
@@ -544,6 +548,9 @@ def create_server(**init_kwargs) -> FastMCP:
             target_score=target_score,
             max_experiments=max_experiments,
             bounds=bounds,
+            initial_kp=initial_kp,
+            initial_ki=initial_ki,
+            initial_kd=initial_kd,
             setpoint_rad=setpoint_rad,
             experiment_duration_s=experiment_duration_s,
         )
