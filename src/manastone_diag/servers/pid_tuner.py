@@ -461,41 +461,42 @@ def create_server(**init_kwargs) -> FastMCP:
     @mcp.tool()
     async def pid_run_research_loop(
         joint_name: str,
-        max_turns: int = 15,
         target_score: float = 85.0,
+        max_experiments: int = 50,
         setpoint_rad: float = 0.5,
         experiment_duration_s: float = 2.0,
         ctx: Context = None,
     ) -> str:
         """
-        AutoResearch 风格的 PID 调参 Agent 循环。
+        "不达目标不罢休"的 PID 调参 Agent 循环（AutoResearch 风格）。
 
-        ┌ 架构对比 ──────────────────────────────────────────────┐
-        │ pid_run_auto_tuning  ：Python for-loop 控制迭代        │
-        │                       LLM 是被调用的子函数              │
-        │                       Python 决定何时停止               │
+        ┌ 与 pid_run_auto_tuning 的本质区别 ─────────────────────┐
         │                                                        │
-        │ pid_run_research_loop：LLM while-loop 控制迭代         │
-        │   messages = [task]                                    │
-        │   while True:  ← LLM 是主体                           │
-        │     msg = llm(messages, tools)                         │
-        │     if msg.tool_calls:                                 │
-        │       results = execute(tool_calls)  ← Python 执行    │
-        │       messages += [msg, results]                       │
-        │     else: break  ← LLM 自己决定停                     │
+        │  pid_run_auto_tuning：                                 │
+        │    Python for-loop 控制迭代                            │
+        │    LLM 是被调用的子函数                                  │
+        │    Python 检查 score >= target 来决定停止               │
+        │                                                        │
+        │  pid_run_research_loop：                               │
+        │    messages = [task]                                   │
+        │    while experiments < max_experiments:  ← 安全网      │
+        │        msg = llm(messages, tools)  ← LLM 是主体       │
+        │        execute(msg.tool_calls)     ← Python 执行      │
+        │        if finish 且分数达标: break                     │
+        │        if finish 但未达标: 拒绝 → 注入"继续"消息       │
+        │        if 刚跑了实验 且未达标: 自动注入"继续"消息       │
         └────────────────────────────────────────────────────────┘
 
-        LLM 可在每一轮自主选择：
-          - 调用 run_experiment 测试新参数
-          - 调用 get_history 回顾历史趋势
-          - 调用 finish 结束并提交最终参数
-        LLM 的全部推理过程保留在消息历史中（可追溯）。
+        停止条件（按优先级）：
+          1. LLM 调用 finish 且 best_score >= target_score → 成功退出
+          2. max_experiments 达到上限 → 安全网强制退出（人为设定的兜底）
+          3. LLM 提前调用 finish → 被拒绝，系统自动推它继续
 
         Args:
-            joint_name:           目标关节名
-            max_turns:            最大 LLM 对话轮数（每轮可能调多个工具）
-            target_score:         LLM 知晓的目标分数（写入初始任务消息）
-            setpoint_rad:         阶跃目标位置
+            joint_name:            目标关节名
+            target_score:          目标分数（LLM 不达到此分数不允许停止）
+            max_experiments:       最大实验次数安全上限（默认 50）
+            setpoint_rad:          阶跃目标位置
             experiment_duration_s: 每次实验时长
         """
         s, safety, runner, history, optimizer = _get_subsystems()
@@ -541,11 +542,10 @@ def create_server(**init_kwargs) -> FastMCP:
             joint_name=joint_name,
             joint_group=group,
             target_score=target_score,
-            max_turns=max_turns,
+            max_experiments=max_experiments,
             bounds=bounds,
             setpoint_rad=setpoint_rad,
             experiment_duration_s=experiment_duration_s,
-            mock_mode=s.mock_mode,
         )
 
         return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
