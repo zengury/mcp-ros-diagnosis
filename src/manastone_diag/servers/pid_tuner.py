@@ -36,7 +36,7 @@ from ..pid_tuning.safety import SafetyGuard
 from ..pid_tuning.experiment import ExperimentRunner, ExperimentConfig
 from ..pid_tuning.optimizer import TuningHistory, PIDOptimizer
 from ..pid_tuning.agent_loop import PIDAgentLoop
-from ..motion import ScenarioInterpreter, ScenarioLibrary
+from ..motion import ScenarioLibrary
 
 logger = logging.getLogger(__name__)
 
@@ -692,11 +692,11 @@ def create_server(**init_kwargs) -> FastMCP:
         }, ensure_ascii=False, indent=2)
 
     # ════════════════════════════════════════════════════════════
-    # Tool 10: 场景实验 — NL → 结构化实验配置 → 执行
+    # Tool 10: 场景实验 — 按场景 ID 执行多阶段 PID 测试
     # ════════════════════════════════════════════════════════════
     @mcp.tool()
     async def pid_run_scenario(
-        scenario: str,
+        scenario_id: str,
         joint_name: str = "",
         kp: float = 0.0,
         ki: float = 0.0,
@@ -704,39 +704,32 @@ def create_server(**init_kwargs) -> FastMCP:
         ctx: Context = None,
     ) -> str:
         """
-        用自然语言描述一个运动场景，自动翻译为实验配置并执行。
+        按预置场景的物理参数（角度/时长/负载上下文）执行多阶段 PID 实验。
 
-        支持三种输入方式：
-          1. 自然语言: "模拟机器人上楼梯时左膝关节的响应"
-          2. 场景 ID:  "stair_ascent"（用 pid_list_scenarios 查看所有 ID）
-          3. 混合:     "下楼梯 右膝 45度"（关键词+关节+角度）
+        先用 pid_list_scenarios 查看可用场景，再用此工具执行。
+        场景中编码了每个动作阶段的物理约束和调参提示（phase_notes），
+        用于在 research 中复现特定运动负载条件。
 
-        翻译策略（自动降级）：
-          LLM 理解 → 关键词匹配 → 兜底构造
-
-        若 kp/ki/kd 全为 0，使用关节的历史最优参数（或默认初始值）进行实验。
-        若指定了 kp/ki/kd，使用指定参数在场景条件下测试。
+        若 kp/ki/kd 全为 0，自动使用该关节的历史最优参数。
 
         Args:
-            scenario:   自然语言描述或场景 ID
-            joint_name: 覆盖场景默认关节（可选）
-            kp/ki/kd:   PID 参数（0=使用历史最优）
+            scenario_id: 场景 ID，如 "stair_ascent"（用 pid_list_scenarios 查看）
+            joint_name:  覆盖场景默认关节，如 "right_knee"（可选）
+            kp/ki/kd:    PID 参数（0=使用历史最优或保守初始值）
         """
         s, safety, runner, history, optimizer = _get_subsystems()
 
-        # ── 1. 翻译场景 ──────────────────────────────────────
-        llm_client = getattr(s, "llm_client", None)
-        interpreter = ScenarioInterpreter(
-            llm_client=llm_client,
-            robot_schema=s.schema,
-        )
-        interp_result = await interpreter.interpret(
-            description=scenario,
-            robot_type=s.schema.robot_type,
-        )
-        motion_scenario = interp_result.scenario
+        # ── 1. 查找场景 ──────────────────────────────────────
+        lib = ScenarioLibrary()
+        motion_scenario = lib.get(scenario_id)
+        if motion_scenario is None:
+            available = [sc.scenario_id for sc in lib.for_robot(s.schema.robot_type)]
+            return json.dumps({
+                "error": f"未找到场景 '{scenario_id}'",
+                "available_for_this_robot": available,
+                "tip": "调用 pid_list_scenarios 查看完整场景列表",
+            }, ensure_ascii=False, indent=2)
 
-        # 如果调用方指定了关节名，优先覆盖
         if joint_name:
             motion_scenario = motion_scenario.for_joint(joint_name)
 
@@ -852,11 +845,7 @@ def create_server(**init_kwargs) -> FastMCP:
                 "id": motion_scenario.scenario_id,
                 "name": motion_scenario.name,
                 "description": motion_scenario.description,
-            },
-            "interpretation": {
-                "method": interp_result.method,
-                "confidence": interp_result.confidence,
-                "reasoning": interp_result.reasoning,
+                "joint_override": joint_name or None,
             },
             "summary": {
                 "total_phases": len(motion_scenario.phases),
