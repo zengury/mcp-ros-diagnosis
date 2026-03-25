@@ -1,9 +1,9 @@
 # PRD — AI 自动 PID 调参系统
 ## Manastone Diagnostic · PID Auto-Tuning Module
 
-**版本**: 1.0
-**日期**: 2026-03-20
-**状态**: 已实现（MVP）
+**版本**: 1.2
+**日期**: 2026-03-25
+**状态**: 已实现（MVP + 多机器人 + 场景知识库）
 
 ---
 
@@ -64,17 +64,24 @@ Unitree G1 人形机器人共有 37 个自由度，每个关节独立运行 PID 
 
 ```
 MCP Client (Claude / 工程师)
-        │
+        │  自然语言意图
+        │  Claude 负责语义理解，Server 负责执行
         │ MCP over SSE (:8087)
         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  manastone-pid-tuner  (pid_tuner.py)                        │
+│  manastone-pid-tuner  (pid_tuner.py)   10 个 MCP 工具       │
 │                                                             │
-│  ┌──────────────┐   ┌───────────────┐   ┌───────────────┐  │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  motion/  场景知识库（物理参数编码层）                   │ │
+│  │  ScenarioLibrary ── MotionScenario ── ExperimentPhase  │ │
+│  │  可持续扩展的运动场景 × 物理约束 × 调参提示              │ │
+│  └──────────────────────────┬─────────────────────────────┘ │
+│                             │ scenario → ExperimentConfig   │
+│  ┌──────────────┐   ┌───────▼───────┐   ┌───────────────┐  │
 │  │  PIDAgentLoop│   │ExperimentRunner│   │  SafetyGuard  │  │
 │  │  agent_loop  │   │  experiment   │   │   safety      │  │
 │  └──────┬───────┘   └───────┬───────┘   └───────┬───────┘  │
-│         │                   │                   │          │
+│         │             Euler/MuJoCo/Real          │          │
 │  ┌──────▼───────┐   ┌───────▼───────┐           │          │
 │  │ PIDWorkspace │   │  PIDScorer    │           │          │
 │  │  workspace   │   │   scorer      │           │          │
@@ -88,6 +95,8 @@ MCP Client (Claude / 工程师)
         ▼                           ▼
  DDS Bridge / Mock           git repo + filesystem
  (ROS2 Joint Data)        storage/pid_workspace/{joint}/
+ SchemaRegistry
+ (多机器人 schema)
 ```
 
 ### 3.2 autoresearch 核心循环
@@ -248,7 +257,95 @@ llm_model: str           # 可选：指定 LLM 模型
 **输出**: `{cleared: bool, message: str}`
 **描述**: 清空实验历史（需 confirm=true）
 
-### 4.2 评分系统
+#### F-09: `pid_list_scenarios`
+**输入**: `robot_type: str`（可选，过滤）
+**输出**: `{scenarios: List[ScenarioSummary], total: int}`
+**描述**: 列出场景知识库中所有可用运动场景（含 ID、关键词、物理约束提示）
+
+#### F-10: `pid_run_scenario`
+**输入**: `scenario_id: str, joint_name: str, kp/ki/kd: float`
+**输出**: `{scenario, summary, phases: List[PhaseResult]}`
+**描述**: 按预置场景的物理参数执行多阶段实验，自动使用历史最优参数
+
+### 4.2 场景知识库（motion/）
+
+#### 设计理念
+
+场景知识库是系统**持续积累经验**的核心机制。它与 PID 参数历史（`results.tsv`）的区别在于：
+
+| | PID 历史（results.tsv） | 场景知识库（ScenarioLibrary）|
+|--|------------------------|------------------------------|
+| **存储内容** | 实验数据（kp/ki/kd/score）| 物理约束 + 调参经验（领域知识）|
+| **生命周期** | 单关节、单次调参会话 | 跨机器人、跨关节、永久积累 |
+| **来源** | 自动生成 | 工程师手工提炼 + 实验归纳 |
+| **作用** | LLM 参数探索的上下文 | 告知 LLM"这个场景允许多少超调" |
+
+#### 核心数据结构
+
+```python
+ExperimentPhase:
+  joint_name: str          # 目标关节
+  setpoint_rad: float      # 该运动的典型目标角度
+  duration_s: float        # 运动持续时长
+  phase_notes: str         # ★ 物理约束说明（最有价值的字段）
+                           # 例："下楼梯落地缓冲，超调>5%会踩空"
+                           #     "单腿承重35kg，稳态误差<1%"
+
+MotionScenario:
+  scenario_id: str         # 唯一标识，如 "stair_descent"
+  phases: List[ExperimentPhase]
+  target_score_hint: float # 该场景建议的调参目标分数
+```
+
+#### 当前预置场景（v1.2，15 个）
+
+| 类别 | 场景 ID | 适用机器人 |
+|------|---------|-----------|
+| 基础 | `static_stand`, `balance_perturbation` | G1, B1 |
+| 步行 | `normal_walking`, `fast_walking` | G1 |
+| 楼梯 | `stair_ascent`, `stair_descent` | G1 |
+| 蹲起 | `squat`, `single_leg_stance` | G1 |
+| 手臂 | `arm_wave`, `arm_reach`, `heavy_carry` | G1, xArm7 |
+| 四足 | `quadruped_trot`, `quadruped_jump` | Go2, B1 |
+| 工业 | `xarm_assembly`, `xarm_welding` | xArm7 |
+
+#### 场景扩展原则
+
+场景库的设计目标是**无上限地积累工程经验**。新场景的来源：
+
+1. **实验归纳**：调参过程中发现某个运动工况反复出现 → 提炼为新场景
+2. **硬件扩展**：接入新机器人型号 → 添加对应的运动场景
+3. **故障复现**：现场遇到特定负载导致的失效 → 保存为场景以便回归测试
+4. **跨项目迁移**：从其他机器人项目（如 dimos）移植已验证的物理参数
+
+**新增场景的最低要求**：
+
+```python
+ExperimentPhase(
+    joint_name="...",
+    setpoint_rad=X,        # 必须：来自实测或文献
+    duration_s=Y,          # 必须：来自实测
+    phase_notes="...",     # 必须：说明物理约束和调参重点
+)
+```
+
+`phase_notes` 是知识库的核心价值——它把隐性的工程经验（"这个角度下膝关节惯量是平地行走的3倍"）变成 LLM 调参时可消费的显性知识。
+
+#### 与 MCP 部署的关系
+
+部署后 Claude 是自然语言到场景 ID 的翻译层，Server 是执行层：
+
+```
+工程师: "测试机器人在单腿平衡时右膝的刚度"
+Claude: pid_list_scenarios() → 选择 single_leg_stance
+Claude: pid_run_scenario("single_leg_stance", joint_name="right_knee")
+Server: 执行 phases[0]，setpoint=0.35rad，带 phase_notes 上下文
+Claude: 解读结果，结合 phase_notes 中"稳态误差<1%"给出调参建议
+```
+
+Server 中不内置 NL 翻译——这部分由 Claude 完成，避免双重 LLM 调用。
+
+### 4.4 评分系统
 
 评分范围 0-100 分，由五项指标加权扣分：
 
@@ -262,7 +359,7 @@ llm_model: str           # 可选：指定 LLM 模型
 
 **评级**：A(≥90) / B(≥75) / C(≥60) / D(≥45) / F(<45)
 
-### 4.3 安全系统
+### 4.5 安全系统
 
 **三层防护**：
 
@@ -406,27 +503,38 @@ PIDAgentLoop.run()
 
 ## 8. 里程碑
 
-### M1（当前 MVP）— 已完成
+### M1（MVP）— 已完成
 - [x] `scorer.py` — 五维评分 + 中文诊断
 - [x] `safety.py` — 三层安全防护
-- [x] `experiment.py` — Mock 物理仿真 + Real 接口
+- [x] `experiment.py` — Mock 物理仿真（Euler）+ Real 接口
 - [x] `workspace.py` — autoresearch 工作区管理（含 git 操作）
 - [x] `agent_loop.py` — autoresearch 风格主循环
 - [x] `pid_tuner.py` — MCP Server（8 个工具）
 - [x] Schema 配置（robot_schema.yaml 安全边界）
 - [x] 集成测试通过（Mock 模式）
 
+### M1.2（多机器人 + 场景知识库）— 已完成
+- [x] `SchemaRegistry` — 多机器人 schema 动态加载，env var 切换
+- [x] `config/schemas/unitree_go2.yaml` — 12DOF 四足，含足端力传感器
+- [x] `config/schemas/unitree_b1.yaml` — 重型四足，80Nm，48V 电池
+- [x] `config/schemas/xarm7.yaml` — 7DOF 工业机械臂，含控制器状态
+- [x] `experiment.py` — MuJoCo 仿真后端（RK4，可选依赖，自动回退）
+- [x] `motion/scenario.py` — 场景知识库（15 个预置场景）
+- [x] `pid_list_scenarios` / `pid_run_scenario` — MCP 工具 9/10
+
 ### M2（计划）
-- [ ] 真实 ROS2 关节控制（DDS 写入指令）
+- [ ] 真实 ROS2 关节控制（DDS 写入指令，`_run_real` 实现）
 - [ ] 多关节并行调参（asyncio.gather）
 - [ ] 调参会话断点续传（跨进程 workspace 恢复）
 - [ ] Web UI 实时进度展示（Gradio）
 - [ ] 贝叶斯优化后备策略（LLM 调用失败时）
+- [ ] 场景自动生成：从 `results.tsv` 归纳高频负载工况，提议新场景
 
 ### M3（愿景）
-- [ ] 全身 37 关节批量调参
-- [ ] 跨机器人参数迁移学习
-- [ ] 在线调参（不停机，边运动边优化）
+- [ ] 全身 37 关节批量调参（优先级队列 + 热保护限流）
+- [ ] 跨机器人参数迁移：G1 调好的腿部参数为 Go2 提供初始值
+- [ ] 在线调参（不停机，边运动边优化，需真机 M2 完成后）
+- [ ] 场景知识库自治增长：LLM 从实验日志自动提炼新场景并 PR
 
 ---
 
