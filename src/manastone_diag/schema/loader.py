@@ -131,6 +131,7 @@ class RobotSchema:
     topics: List[TopicSchema]
     components: Dict[str, ComponentInfo]   # component_id → ComponentInfo
     event_types: Dict[str, EventTypeInfo]  # event_type → EventTypeInfo
+    pid_safety_bounds: Dict[str, Dict]     # joint_name → PID 安全边界配置（供 pid_tuner 使用）
 
     def get_topic(self, topic_name: str) -> Optional[TopicSchema]:
         return next((t for t in self.topics if t.topic == topic_name), None)
@@ -180,7 +181,7 @@ class RobotSchema:
 
 class SchemaLoader:
     """
-    从 config/robot_schema.yaml 加载 RobotSchema。
+    从指定 YAML 文件加载 RobotSchema。
 
     也支持加载 discovery 生成的动态 schema（未知机器人自动发现后写入）。
     """
@@ -201,6 +202,7 @@ class SchemaLoader:
         joint_components = self._generate_joint_components(raw.get("topics", []))
         components.update(joint_components)
         event_types = self._parse_event_types(raw.get("event_types", {}))
+        pid_safety_bounds = raw.get("pid_safety_bounds", {})
 
         schema = RobotSchema(
             robot_type=raw.get("robot_type", "unknown"),
@@ -208,6 +210,7 @@ class SchemaLoader:
             topics=topics,
             components=components,
             event_types=event_types,
+            pid_safety_bounds=pid_safety_bounds,
         )
         logger.info(
             "Schema 加载完成: %s | %d 个话题 | %d 个组件 | %d 种事件类型",
@@ -314,3 +317,102 @@ class SchemaLoader:
                 retention_days=spec.get("retention_days", 30),
             )
         return result
+
+
+# ── SchemaRegistry ────────────────────────────────────────────────────────────
+
+class SchemaRegistry:
+    """
+    多机器人 schema 注册表。
+
+    扫描 config/schemas/ 目录（优先）和 config/ 根目录（回退），
+    按 robot_type 字段建立索引，支持按类型动态加载。
+
+    用法：
+        registry = SchemaRegistry(config_dir)
+        schema = registry.load("unitree_go2")
+
+    环境变量 MANASTONE_ROBOT_TYPE 可覆盖默认 robot_type。
+    """
+
+    _DEFAULT_SCHEMA_FILENAME = "robot_schema.yaml"
+
+    def __init__(self, config_dir: str | Path):
+        self.config_dir = Path(config_dir)
+        self._index: Dict[str, Path] = {}  # robot_type → yaml path
+        self._scan()
+
+    def _scan(self) -> None:
+        """扫描 config/schemas/ 和 config/ 目录，建立 robot_type → 文件路径索引。"""
+        candidates: List[Path] = []
+
+        schemas_dir = self.config_dir / "schemas"
+        if schemas_dir.exists():
+            candidates.extend(sorted(schemas_dir.glob("*.yaml")))
+
+        # 根目录的 robot_schema.yaml 作为默认回退
+        default = self.config_dir / self._DEFAULT_SCHEMA_FILENAME
+        if default.exists():
+            candidates.append(default)
+
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    raw = yaml.safe_load(f)
+                robot_type = raw.get("robot_type")
+                if robot_type and robot_type not in self._index:
+                    self._index[robot_type] = path
+                    logger.debug("SchemaRegistry: 注册 %s → %s", robot_type, path.name)
+            except Exception as e:
+                logger.warning("SchemaRegistry: 跳过损坏的 schema 文件 %s: %s", path, e)
+
+        logger.info(
+            "SchemaRegistry: 扫描完成，共注册 %d 种机器人类型: %s",
+            len(self._index), list(self._index.keys())
+        )
+
+    def available_types(self) -> List[str]:
+        """返回已注册的所有 robot_type 列表。"""
+        return list(self._index.keys())
+
+    def get_schema_path(self, robot_type: str) -> Optional[Path]:
+        """返回 robot_type 对应的 schema 文件路径，不存在则返回 None。"""
+        return self._index.get(robot_type)
+
+    def load(self, robot_type: Optional[str] = None) -> "RobotSchema":
+        """
+        按 robot_type 加载 schema。
+
+        优先级：
+          1. 传入的 robot_type 参数
+          2. 环境变量 MANASTONE_ROBOT_TYPE
+          3. 注册表中的第一个（按扫描顺序）
+          4. config/robot_schema.yaml 默认文件（最终兜底）
+        """
+        import os
+
+        resolved_type = (
+            robot_type
+            or os.getenv("MANASTONE_ROBOT_TYPE")
+        )
+
+        if resolved_type:
+            path = self._index.get(resolved_type)
+            if path is None:
+                available = self.available_types()
+                raise ValueError(
+                    f"未找到 robot_type='{resolved_type}' 的 schema。"
+                    f"已注册类型: {available}"
+                )
+        elif self._index:
+            # 默认选第一个（通常是默认 robot_schema.yaml）
+            resolved_type, path = next(iter(self._index.items()))
+            logger.info("SchemaRegistry: 未指定 robot_type，使用默认: %s", resolved_type)
+        else:
+            # 最终兜底
+            path = self.config_dir / self._DEFAULT_SCHEMA_FILENAME
+            if not path.exists():
+                raise FileNotFoundError(f"未找到任何 schema 文件，检查目录: {self.config_dir}")
+
+        loader = SchemaLoader(path)
+        return loader.load()

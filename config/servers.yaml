@@ -62,6 +62,14 @@ servers:
     component_groups: [motion_controller]
     required: false
 
+  - id: pid_tuner
+    name: manastone-pid-tuner
+    enabled: false          # 默认关闭，调参时手动启用（避免误操作真机）
+    port: 8087
+    description: AI 驱动的 PID 自动调参（安全围栏 + LLM 搜索 + 环境一致性检查）
+    component_groups: [body_joints]
+    required: false
+
   - id: core
     name: manastone-core
     enabled: true

@@ -1,0 +1,19 @@
+# PID 调参参数文件
+# 假设（Hypothesis）：
+#   第1次，Kd=2.0
+#
+joint: left_knee
+
+pid:
+  kp: 20.0
+  ki: 0.3
+  kd: 2.0
+
+experiment:
+  setpoint_rad: 0.5
+  duration_s: 2.0
+
+safety_bounds:
+  kp_range: [1.0, 80.0]
+  ki_range: [0.0, 3.0]
+  kd_range: [0.0, 20.0]

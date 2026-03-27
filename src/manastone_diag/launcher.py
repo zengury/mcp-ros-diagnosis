@@ -35,13 +35,14 @@ logger = logging.getLogger("manastone.launcher")
 # ── Server 注册表 ─────────────────────────────────────────────
 # 每个 id 对应一个 create_server 工厂函数
 SERVER_REGISTRY = {
-    "joints":  "manastone_diag.servers.joints",
-    "power":   "manastone_diag.servers.power",
-    "imu":     "manastone_diag.servers.imu",
-    "hand":    "manastone_diag.servers.hand",
-    "vision":  "manastone_diag.servers.vision",
-    "motion":  "manastone_diag.servers.motion",
-    "core":    "manastone_diag.servers.core",
+    "joints":    "manastone_diag.servers.joints",
+    "power":     "manastone_diag.servers.power",
+    "imu":       "manastone_diag.servers.imu",
+    "hand":      "manastone_diag.servers.hand",
+    "vision":    "manastone_diag.servers.vision",
+    "motion":    "manastone_diag.servers.motion",
+    "pid_tuner": "manastone_diag.servers.pid_tuner",
+    "core":      "manastone_diag.servers.core",
 }
 
 

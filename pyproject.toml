@@ -39,6 +39,7 @@ manastone-imu     = "manastone_diag.servers.imu:main"
 manastone-hand    = "manastone_diag.servers.hand:main"
 manastone-vision  = "manastone_diag.servers.vision:main"
 manastone-motion  = "manastone_diag.servers.motion:main"
+manastone-pid-tuner = "manastone_diag.servers.pid_tuner:main"
 # Legacy single-server entry point (kept for backward compat)
 manastone-diag    = "manastone_diag.server:main"
 manastone-ui      = "manastone_diag.ui:main"

@@ -1,0 +1,247 @@
+# ============================================================
+# Manastone Robot Schema — UFACTORY xArm 7
+# 版本: 1.0
+#
+# xArm 7DOF 工业机械臂，7个串联旋转关节
+# 额定载重 3.5kg，最大臂展 700mm
+# 关节力矩范围：Joint1-4 约 50Nm，Joint5-7 约 20-30Nm
+#
+# 接口：以太网 TCP，xArm SDK 控制
+# ROS2：通过 xarm_ros2 发布 /joint_states（sensor_msgs/JointState）
+#
+# 注意：xArm 固件自带 PID 控制，通过 speed/mvacc 参数间接调节
+#       本 schema 提供关节级监控，PID 边界基于典型速度/力矩参数
+# ============================================================
+
+robot_type: xarm7
+robot_variant: "7dof"
+robot_id_env: MANASTONE_ROBOT_ID
+schema_version: "1.0"
+
+topics:
+
+  # ── xArm7 关节状态（sensor_msgs/JointState @ 10Hz）────────
+  - topic: /joint_states
+    description: xArm7 7个关节的位置/速度/力矩
+    message_type: sensor_msgs/msg/JointState
+    message_protocol: standard_joint_state
+    mock_scenario: xarm7_joint_states
+    component_group: arm_joints
+    poll_hz: 5
+
+    # standard_joint_state 协议：name[] 字段直接包含关节名
+    # 无需 motor_index_map，SchemaLoader 从 name[] 自动映射
+    motor_index_map:
+      0: { name: joint1, canonical: 第1轴（底座旋转）, group: arm, side: center, rated_torque_nm: 50.0 }
+      1: { name: joint2, canonical: 第2轴（肩俯仰）,   group: arm, side: center, rated_torque_nm: 50.0 }
+      2: { name: joint3, canonical: 第3轴（肘旋转）,   group: arm, side: center, rated_torque_nm: 30.0 }
+      3: { name: joint4, canonical: 第4轴（肘俯仰）,   group: arm, side: center, rated_torque_nm: 30.0 }
+      4: { name: joint5, canonical: 第5轴（腕旋转）,   group: arm, side: center, rated_torque_nm: 20.0 }
+      5: { name: joint6, canonical: 第6轴（腕俯仰）,   group: arm, side: center, rated_torque_nm: 20.0 }
+      6: { name: joint7, canonical: 第7轴（末端旋转）, group: arm, side: center, rated_torque_nm: 10.0 }
+
+    fields:
+      - path: "effort[*]"
+        index_key: joint_index
+        component_template: "joint_{name}"
+        unit: Nm
+        semantic_type: torque
+        description: 关节力矩
+        thresholds:
+          warning:  { value: 35.0, direction: above }   # 通用警告（Joint1-4 额定50Nm）
+          critical: { value: 45.0, direction: above }
+        events:
+          warning:  JOINT_TORQUE_WARNING
+          critical: JOINT_TORQUE_CRITICAL
+          recovery: JOINT_TORQUE_NORMAL
+
+      - path: "velocity[*]"
+        index_key: joint_index
+        component_template: "joint_{name}"
+        unit: rad/s
+        semantic_type: velocity
+        description: 关节角速度
+        thresholds:
+          warning:  { value: 3.0, direction: above }    # xArm 最大速度 3.14 rad/s
+          critical: { value: 3.5, direction: above }
+        events:
+          warning:  JOINT_VELOCITY_WARNING
+          critical: JOINT_VELOCITY_CRITICAL
+
+  # ── xArm 控制器状态（通过 /xarm/robot_states @ 5Hz）────────
+  - topic: /xarm/robot_states
+    description: xArm 控制器状态（错误码、模式、运动状态）
+    message_type: xarm_msgs/msg/RobotMsg
+    message_protocol: xarm_robot_state
+    mock_scenario: xarm7_robot_state
+    component_group: controller
+    poll_hz: 5
+    fields:
+      - path: "err"
+        component: xarm_controller
+        unit: error_code
+        semantic_type: error_code
+        description: 控制器错误码（0=正常）
+        thresholds:
+          critical: { value: 0, direction: not_equal }
+        events:
+          critical: CONTROLLER_ERROR
+          recovery: CONTROLLER_NORMAL
+
+      - path: "state"
+        component: xarm_controller
+        unit: state_code
+        semantic_type: driver_state
+        description: 控制器状态（4=运动中，1=停止）
+        thresholds:
+          warning:  { value: 3, direction: above }
+        events:
+          warning:  CONTROLLER_STATE_WARNING
+
+  # ── 末端执行器（夹爪）────────────────────────────────────
+  - topic: /xarm/gripper_states
+    description: xArm 夹爪状态
+    message_type: xarm_msgs/msg/GripperState
+    message_protocol: xarm_gripper_state
+    mock_scenario: xarm7_gripper
+    component_group: end_effector
+    poll_hz: 2
+    fields:
+      - path: "curr_pos"
+        component: gripper
+        unit: mm
+        semantic_type: gripper_position
+        description: 夹爪开合距离（0=全闭 850=全开）
+        thresholds:
+          warning:  { value: 840.0, direction: above }   # 接近机械限位
+        events:
+          warning:  GRIPPER_LIMIT_WARNING
+
+# ── 非关节组件 ────────────────────────────────────────────────
+components:
+  controller:
+    type: motion_controller
+    description: xArm 运动控制器
+    instances:
+      xarm_controller: { name: xArm控制器, location: base }
+  end_effector:
+    type: gripper
+    description: xArm 标准夹爪
+    instances:
+      gripper: { name: 标准二指夹爪, max_open_mm: 85 }
+
+# ── PID 调参安全边界 ─────────────────────────────────────────
+# xArm 固件内置 PID，外部可通过 Kp/Kv（位置/速度增益）调节
+# 此处参数对应 xArm SDK 中的 position_kp / velocity_kp 概念
+# 实际数值范围参考 UFACTORY 技术文档
+pid_safety_bounds:
+  default:
+    kp_min: 0.1
+    kp_max: 30.0
+    ki_min: 0.0
+    ki_max: 2.0
+    kd_min: 0.0
+    kd_max: 5.0
+    max_torque_nm: 35.0
+    max_velocity_rad_s: 3.0
+    max_temp_rise_c: 4.0
+
+  # Joint1-2：底座和肩部，惯量最大
+  joint1:
+    kp_min: 1.0
+    kp_max: 50.0
+    ki_min: 0.0
+    ki_max: 2.0
+    kd_min: 0.0
+    kd_max: 10.0
+    max_torque_nm: 45.0
+    max_velocity_rad_s: 2.5
+    max_temp_rise_c: 5.0
+
+  joint2:
+    kp_min: 1.0
+    kp_max: 50.0
+    ki_min: 0.0
+    ki_max: 2.0
+    kd_min: 0.0
+    kd_max: 10.0
+    max_torque_nm: 45.0
+    max_velocity_rad_s: 2.5
+    max_temp_rise_c: 5.0
+
+  # Joint3-4：中段，中等惯量
+  joint3:
+    kp_min: 0.5
+    kp_max: 35.0
+    ki_min: 0.0
+    ki_max: 2.0
+    kd_min: 0.0
+    kd_max: 7.0
+    max_torque_nm: 28.0
+    max_velocity_rad_s: 3.0
+    max_temp_rise_c: 4.0
+
+  joint4:
+    kp_min: 0.5
+    kp_max: 35.0
+    ki_min: 0.0
+    ki_max: 2.0
+    kd_min: 0.0
+    kd_max: 7.0
+    max_torque_nm: 28.0
+    max_velocity_rad_s: 3.0
+    max_temp_rise_c: 4.0
+
+  # Joint5-7：腕部，惯量最小，响应最快
+  joint5:
+    kp_min: 0.1
+    kp_max: 20.0
+    ki_min: 0.0
+    ki_max: 1.5
+    kd_min: 0.0
+    kd_max: 4.0
+    max_torque_nm: 18.0
+    max_velocity_rad_s: 3.5
+    max_temp_rise_c: 3.0
+
+  joint6:
+    kp_min: 0.1
+    kp_max: 20.0
+    ki_min: 0.0
+    ki_max: 1.5
+    kd_min: 0.0
+    kd_max: 4.0
+    max_torque_nm: 18.0
+    max_velocity_rad_s: 3.5
+    max_temp_rise_c: 3.0
+
+  joint7:
+    kp_min: 0.1
+    kp_max: 15.0
+    ki_min: 0.0
+    ki_max: 1.0
+    kd_min: 0.0
+    kd_max: 3.0
+    max_torque_nm: 9.0
+    max_velocity_rad_s: 3.5
+    max_temp_rise_c: 3.0
+
+# ── 组件覆盖（末端关节力矩阈值更保守）────────────────────────
+component_overrides:
+  joint_joint5: { torque_warning_nm: 15.0, torque_critical_nm: 18.0 }
+  joint_joint6: { torque_warning_nm: 15.0, torque_critical_nm: 18.0 }
+  joint_joint7: { torque_warning_nm: 7.0,  torque_critical_nm: 9.0  }
+
+# ── 事件类型定义 ─────────────────────────────────────────────
+event_types:
+  JOINT_TORQUE_WARNING:     { severity: WARNING,  description: 关节力矩超过警告阈值,   retention_days: 30 }
+  JOINT_TORQUE_CRITICAL:    { severity: CRITICAL, description: 关节力矩接近额定上限,   retention_days: 90 }
+  JOINT_TORQUE_NORMAL:      { severity: INFO,     description: 关节力矩恢复正常,       retention_days: 7  }
+  JOINT_VELOCITY_WARNING:   { severity: WARNING,  description: 关节速度超过3rad/s,     retention_days: 30 }
+  JOINT_VELOCITY_CRITICAL:  { severity: CRITICAL, description: 关节速度超过3.5rad/s,   retention_days: 90 }
+  CONTROLLER_ERROR:         { severity: CRITICAL, description: xArm控制器报错,         retention_days: 90 }
+  CONTROLLER_NORMAL:        { severity: INFO,     description: xArm控制器恢复正常,     retention_days: 7  }
+  CONTROLLER_STATE_WARNING: { severity: WARNING,  description: xArm控制器状态异常,     retention_days: 30 }
+  GRIPPER_LIMIT_WARNING:    { severity: WARNING,  description: 夹爪接近机械限位,       retention_days: 30 }
+  TOPIC_DATA_STALE:         { severity: WARNING,  description: 话题数据超时未更新,     retention_days: 30 }
+  TOPIC_DATA_RECOVERED:     { severity: INFO,     description: 话题数据恢复,           retention_days: 7  }

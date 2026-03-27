@@ -210,6 +210,90 @@ components:
     instances:
       imu_unit: { name: 主IMU, location: torso }
 
+# ── PID 调参安全边界（pid_tuner server 使用）────────────────
+# 格式：joint_name → {kp_min, kp_max, ki_min, ki_max, kd_min, kd_max,
+#                     max_torque_nm, max_velocity_rad_s, max_temp_rise_c}
+# "default" 作为未列出关节的兜底配置
+pid_safety_bounds:
+  default:
+    kp_min: 0.1
+    kp_max: 50.0
+    ki_min: 0.0
+    ki_max: 5.0
+    kd_min: 0.0
+    kd_max: 10.0
+    max_torque_nm: 30.0
+    max_velocity_rad_s: 15.0
+    max_temp_rise_c: 5.0
+
+  # 腿部承重关节：允许更大的比例增益和力矩
+  left_knee:
+    kp_min: 1.0
+    kp_max: 80.0
+    ki_min: 0.0
+    ki_max: 3.0
+    kd_min: 0.0
+    kd_max: 20.0
+    max_torque_nm: 50.0
+    max_velocity_rad_s: 18.0
+    max_temp_rise_c: 6.0
+
+  right_knee:
+    kp_min: 1.0
+    kp_max: 80.0
+    ki_min: 0.0
+    ki_max: 3.0
+    kd_min: 0.0
+    kd_max: 20.0
+    max_torque_nm: 50.0
+    max_velocity_rad_s: 18.0
+    max_temp_rise_c: 6.0
+
+  left_hip_pitch:
+    kp_min: 1.0
+    kp_max: 80.0
+    ki_min: 0.0
+    ki_max: 2.0
+    kd_min: 0.0
+    kd_max: 18.0
+    max_torque_nm: 55.0
+    max_velocity_rad_s: 15.0
+    max_temp_rise_c: 6.0
+
+  right_hip_pitch:
+    kp_min: 1.0
+    kp_max: 80.0
+    ki_min: 0.0
+    ki_max: 2.0
+    kd_min: 0.0
+    kd_max: 18.0
+    max_torque_nm: 55.0
+    max_velocity_rad_s: 15.0
+    max_temp_rise_c: 6.0
+
+  # 手臂关节：惯量小，允许范围更保守
+  left_elbow:
+    kp_min: 0.5
+    kp_max: 35.0
+    ki_min: 0.0
+    ki_max: 3.0
+    kd_min: 0.0
+    kd_max: 8.0
+    max_torque_nm: 20.0
+    max_velocity_rad_s: 12.0
+    max_temp_rise_c: 4.0
+
+  right_elbow:
+    kp_min: 0.5
+    kp_max: 35.0
+    ki_min: 0.0
+    ki_max: 3.0
+    kd_min: 0.0
+    kd_max: 8.0
+    max_torque_nm: 20.0
+    max_velocity_rad_s: 12.0
+    max_temp_rise_c: 4.0
+
 # ── 关节力矩阈值覆盖（额定力矩较大的关节）──────────────────
 component_overrides:
   joint_left_knee:       { torque_warning_nm: 35.0, torque_critical_nm: 50.0 }

@@ -50,7 +50,9 @@ def get_config() -> Config:
             pass
         _config = Config()
         if os.getenv("MANASTONE_MOCK_MODE"):
-            _config.mock_mode = os.getenv("MANASTONE_MOCK_MODE","").lower() == "true"
+            _config.mock_mode = os.getenv("MANASTONE_MOCK_MODE", "").lower() == "true"
+        # MANASTONE_ROBOT_TYPE 用于 SchemaRegistry.load() 自动选择 schema 文件
+        # 例如：export MANASTONE_ROBOT_TYPE=unitree_go2
         if os.getenv("MANASTONE_DEBUG"):
             _config.debug = os.getenv("MANASTONE_DEBUG","").lower() == "true"
         ext_env = os.getenv("MANASTONE_EXTENSIONS","")

@@ -55,6 +55,7 @@ async def init_shared_state(
         return _shared
 
     from ..schema import SchemaLoader
+    from ..schema.loader import SchemaRegistry
     from ..dds_bridge import DDSBridge
     from ..event import EventLog, EventDetector
     from ..orchestrator.diagnostic import DiagnosticOrchestrator
@@ -66,9 +67,14 @@ async def init_shared_state(
     storage_dir = Path(storage_dir)
     storage_dir.mkdir(parents=True, exist_ok=True)
 
-    # Schema
-    loader = SchemaLoader(schema_path)
-    schema = loader.load()
+    # Schema — 优先用 SchemaRegistry（支持多机器人），回退到直接加载指定文件
+    config_dir = schema_path.parent
+    registry = SchemaRegistry(config_dir)
+    if registry.available_types():
+        schema = registry.load()   # 读取 MANASTONE_ROBOT_TYPE 或默认第一个
+    else:
+        loader = SchemaLoader(schema_path)
+        schema = loader.load()
     logger.info("Schema: %s | %d topics | %d components",
                 schema.robot_type, len(schema.topics), len(schema.components))
 
